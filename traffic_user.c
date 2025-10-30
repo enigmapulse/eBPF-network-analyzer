@@ -9,9 +9,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <linux/if_packet.h>
@@ -20,21 +20,33 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-// same as the kernel struct
+static volatile int running = 1;
+void handle_sigint(int sig) { (void)sig; running = 0; }
+
 struct key_t {
     uint8_t proto;
-    uint8_t pad;
-    uint16_t dport;   
-    uint8_t daddr[4];
+    uint8_t family;      // 4 = IPv4, 6 = IPv6
+    uint16_t sport;
+    uint16_t dport;
+    uint8_t saddr[16];
+    uint8_t daddr[16];
 } __attribute__((packed));
 
-// each entry here constitutes count of packets and their metadata
+struct val_t {
+    uint64_t packets;
+    uint64_t bytes;
+    uint64_t last_seen_ns;
+} __attribute__((aligned(8)));
+
 typedef struct {
     uint64_t cnt;
-    struct key_t k;
+    uint64_t bytes;
+    struct key_t key;
 } entry_t;
 
-// default interface to connect to
+#define MAX_ENTRIES_LIMIT 65536
+#define SCAN_THRESHOLD 50
+
 static const char *default_iface = "eth0";
 
 void usage(const char *prog) {
@@ -44,181 +56,138 @@ void usage(const char *prog) {
 
 int create_and_bind_raw_socket(const char *ifname) {
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sock < 0) {
-        perror("socket");
-        return -1;
-    }
+    if (sock < 0) { perror("socket"); return -1; }
 
-    struct sockaddr_ll sll = {.sll_family = AF_PACKET};
+    struct sockaddr_ll sll = { .sll_family = AF_PACKET };
     sll.sll_ifindex = if_nametoindex(ifname);
     if (sll.sll_ifindex == 0) {
         fprintf(stderr, "if_nametoindex failed for %s\n", ifname);
-        close(sock);
-        return -1;
+        close(sock); return -1;
     }
     sll.sll_protocol = htons(ETH_P_ALL);
-
     if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-        perror("bind");
-        close(sock);
-        return -1;
+        perror("bind"); close(sock); return -1;
     }
     return sock;
 }
 
-// comparison function for qsort
-static int cmp(const void *a, const void *b) {
-    const entry_t *ea = a;
-    const entry_t *eb = b;
-    if (ea->cnt < eb->cnt) return 1;
-    if (ea->cnt > eb->cnt) return -1;
-    return 0;
+static int cmp_entries(const void *a, const void *b) {
+    const entry_t *ea = a, *eb = b;
+    return (ea->cnt < eb->cnt) - (ea->cnt > eb->cnt);
+}
+
+static const char *proto_name(uint8_t proto) {
+    switch (proto) {
+        case 6: return "TCP";
+        case 17: return "UDP";
+        case 1: return "ICMP";
+        case 58: return "ICMPv6";
+        default: return "OTHER";
+    }
+}
+
+static void format_ip(char *buf, size_t len, const struct key_t *key, int is_src) {
+    const void *addr = is_src ? key->saddr : key->daddr;
+    if (key->family == 4)
+        inet_ntop(AF_INET, (uint8_t *)addr + 12, buf, len); // IPv4 stored right-aligned
+    else if (key->family == 6)
+        inet_ntop(AF_INET6, addr, buf, len);
+    else
+        snprintf(buf, len, "?");
 }
 
 int main(int argc, char **argv) {
     const char *iface = default_iface;
-    int interval = 5;
-    int topn = 10;
-    int opt;
+    int interval = 5, topn = 10, opt;
 
     while ((opt = getopt(argc, argv, "i:t:n:")) != -1) {
-        switch (opt) {
-        case 'i': iface = optarg; break;
-        case 't': interval = atoi(optarg); break;
-        case 'n': topn = atoi(optarg); break;
-        default: usage(argv[0]);
-        }
+        if (opt == 'i') iface = optarg;
+        else if (opt == 't') interval = atoi(optarg);
+        else if (opt == 'n') topn = atoi(optarg);
+        else usage(argv[0]);
     }
 
     if (geteuid() != 0) {
-        fprintf(stderr, "This program must be run as root\n");
+        fprintf(stderr, "Must be run as root\n");
         return 1;
     }
 
+    signal(SIGINT, handle_sigint);
     int sock = create_and_bind_raw_socket(iface);
     if (sock < 0) return 1;
 
-    // loading the bpf object
     struct bpf_object *obj = bpf_object__open_file("traffic_kern.o", NULL);
+    if (!obj) { fprintf(stderr, "Failed to open BPF object\n"); return 1; }
+    if (bpf_object__load(obj)) { fprintf(stderr, "Failed to load BPF object\n"); bpf_object__close(obj); return 1; }
 
-    // error handling for object opening and loading
-    if (!obj) {
-        fprintf(stderr, "Failed to open BPF object\n");
-        close(sock);
-        return 1;
-    }
-    if (bpf_object__load(obj)) {
-        fprintf(stderr, "Failed to load BPF object\n");
-        bpf_object__close(obj);
-        close(sock);
-        return 1;
-    }
-
-    struct bpf_program *prog = NULL;
+    struct bpf_program *prog;
     int prog_fd = -1;
-
-    // finds the section named socket and get its file descriptor
     bpf_object__for_each_program(prog, obj) {
         const char *sec = bpf_program__section_name(prog);
-        if (sec && strcmp(sec, "socket") == 0) {
-            prog_fd = bpf_program__fd(prog);
-            break;
-        }
+        if (sec && strcmp(sec, "socket") == 0) { prog_fd = bpf_program__fd(prog); break; }
     }
-
-    if (prog_fd < 0) {
-        fprintf(stderr, "Failed to find socket program in object\n");
-        bpf_object__close(obj);
-        close(sock);
-        return 1;
-    }
+    if (prog_fd < 0) { fprintf(stderr, "No socket section found\n"); return 1; }
 
     if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_BPF, &prog_fd, sizeof(prog_fd)) < 0) {
-        perror("setsockopt(SO_ATTACH_BPF)");
-        bpf_object__close(obj);
-        close(sock);
-        return 1;
+        perror("SO_ATTACH_BPF"); return 1;
     }
 
     int map_fd = bpf_object__find_map_fd_by_name(obj, "stats");
-    if (map_fd < 0) {
-        fprintf(stderr, "Failed to get map fd\n");
-        setsockopt(sock, SOL_SOCKET, SO_DETACH_BPF, &prog_fd, sizeof(prog_fd));
-        bpf_object__close(obj);
-        close(sock);
-        return 1;
-    }
+    if (map_fd < 0) { fprintf(stderr, "Map 'stats' not found\n"); return 1; }
 
     printf("Attached to %s; interval=%ds; top=%d\n", iface, interval, topn);
     printf("Press Ctrl-C to exit.\n");
 
-    while (1) {
+    while (running) {
         sleep(interval);
-
         struct key_t key, next;
-        uint64_t value;
-        size_t cap = 256, cnt = 0;
-        entry_t *arr = malloc(cap * sizeof(entry_t));
-        if (!arr) {
-            perror("malloc");
-            break;
-        }
+        struct val_t val;
+
+        entry_t *arr = calloc(1024, sizeof(entry_t));
+        size_t cnt = 0, cap = 1024;
 
         int res = bpf_map_get_next_key(map_fd, NULL, &key);
         while (res == 0) {
-            if (bpf_map_lookup_elem(map_fd, &key, &value) == 0) {
+            if (bpf_map_lookup_elem(map_fd, &key, &val) == 0) {
                 if (cnt >= cap) {
                     cap *= 2;
-                    entry_t *tmp = realloc(arr, cap * sizeof(entry_t));
-                    if (!tmp) { perror("realloc"); free(arr); arr = NULL; break; }
-                    arr = tmp;
+                    arr = realloc(arr, cap * sizeof(entry_t));
                 }
-                arr[cnt].cnt = value;
-                arr[cnt].k = key;
+                arr[cnt].cnt = val.packets;
+                arr[cnt].bytes = val.bytes;
+                arr[cnt].key = key;
                 cnt++;
             }
             res = bpf_map_get_next_key(map_fd, &key, &next);
-            if (res == 0) key = next;
+            key = next;
         }
 
-        if (!arr) continue; // realloc failed
-        if (cnt == 0) {
-            printf("[no traffic captured in last interval]\n");
-        } else {
-            qsort(arr, cnt, sizeof(entry_t), cmp);
+        if (cnt == 0) { free(arr); continue; }
 
-            for (size_t i = 0; i < (size_t)topn && i < cnt; ++i) {
-                char ipbuf[INET_ADDRSTRLEN];
-                snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
-                        arr[i].k.daddr[0], arr[i].k.daddr[1],
-                        arr[i].k.daddr[2], arr[i].k.daddr[3]);
-                const char *pname = (arr[i].k.proto == 6 ? "TCP" :
-                                    (arr[i].k.proto == 17 ? "UDP" : "-"));
-                printf("{\"cnt\":%llu,\"proto\":\"%s\",\"ip\":\"%s\",\"dport\":%u}\n",
-                    (unsigned long long)arr[i].cnt,
-                    pname,
-                    ipbuf,
-                    ntohs(arr[i].k.dport));
-            }
-            fflush(stdout);
+        qsort(arr, cnt, sizeof(entry_t), cmp_entries);
 
-            // printf("%-10s %-6s %-18s %-6s\n", "COUNT", "PROTO", "DEST_IP", "DPORT");
-            // for (size_t i = 0; i < (size_t)topn && i < cnt; ++i) {
-            //     char ipbuf[INET_ADDRSTRLEN] = {0};
-            //     snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
-            //              arr[i].k.daddr[0], arr[i].k.daddr[1],
-            //              arr[i].k.daddr[2], arr[i].k.daddr[3]);
-            //     const char *pname = (arr[i].k.proto == 6 ? "TCP" :
-            //                         (arr[i].k.proto == 17 ? "UDP" : "-"));
-            //     printf("%-10llu %-6s %-18s %-6u\n",
-            //            (unsigned long long)arr[i].cnt,
-            //            pname,
-            //            ipbuf,
-            //            ntohs(arr[i].k.dport));
-            // }
+        uint64_t total_pkts = 0;
+        for (size_t i = 0; i < cnt; ++i) total_pkts += arr[i].cnt;
+
+        for (size_t i = 0; i < (size_t)topn && i < cnt; ++i) {
+            char s_ip[INET6_ADDRSTRLEN], d_ip[INET6_ADDRSTRLEN];
+            format_ip(s_ip, sizeof(s_ip), &arr[i].key, 1);
+            format_ip(d_ip, sizeof(d_ip), &arr[i].key, 0);
+
+            const char *pname = proto_name(arr[i].key.proto);
+            double pps = (double)arr[i].cnt / interval;
+            double bps = (double)arr[i].bytes / interval;
+            double pct = total_pkts ? ((double)arr[i].cnt * 100.0 / total_pkts) : 0.0;
+
+            printf("{\"src\":\"%s\",\"dst\":\"%s\",\"proto\":\"%s\",\"sport\":%u,\"dport\":%u,"
+                   "\"pkts\":%llu,\"bytes\":%llu,\"pps\":%.2f,\"bps\":%.2f,\"pct\":%.2f}\n",
+                   s_ip, d_ip, pname, ntohs(arr[i].key.sport), ntohs(arr[i].key.dport),
+                   (unsigned long long)arr[i].cnt, (unsigned long long)arr[i].bytes,
+                   pps, bps, pct);
         }
+        fflush(stdout);
 
-        // Clear map
+        // clear map
         struct key_t ktmp, knext;
         int r = bpf_map_get_next_key(map_fd, NULL, &ktmp);
         while (r == 0) {
@@ -227,7 +196,6 @@ int main(int argc, char **argv) {
             if (r == 0) ktmp = knext;
         }
 
-        // printf("------------------------------------------------------------\n");
         free(arr);
     }
 
